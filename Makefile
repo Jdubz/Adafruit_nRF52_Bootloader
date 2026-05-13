@@ -146,6 +146,7 @@ C_SRC += src/boards/boards.c
 # nrfx
 C_SRC += $(NRFX_PATH)/drivers/src/nrfx_power.c
 C_SRC += $(NRFX_PATH)/drivers/src/nrfx_nvmc.c
+C_SRC += $(NRFX_PATH)/drivers/src/nrfx_qspi.c
 C_SRC += $(NRFX_PATH)/mdk/system_$(MCU_SUB_VARIANT).c
 
 # SDK 11 files: serial + OTA DFU
@@ -314,6 +315,11 @@ ifneq ($(USE_NFCT),yes)
 endif
 
 CFLAGS += -DSOFTDEVICE_PRESENT
+# Sealed-device recovery: when no valid app or unspecified-magic DFU entry,
+# default to BLE OTA mode (not USB UF2). Without this, an invalid app sits in
+# USB UF2 mode forever — fatal for installed sculpture devices with no USB
+# access. See docs/SCULPTURE_BLE_RECOVERY_PLAN.md (F1).
+CFLAGS += -DDEFAULT_TO_OTA_DFU
 CFLAGS += -DUF2_VERSION='"$(GIT_VERSION) $(GIT_SUBMODULE_VERSIONS)"'
 CFLAGS += -DBLEDIS_FW_VERSION='"$(GIT_VERSION) $(SD_NAME) $(SD_VERSION)"'
 

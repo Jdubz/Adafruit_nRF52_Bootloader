@@ -115,11 +115,20 @@ extern void tusb_hal_nrf_power_event(uint32_t event);
 #define DFU_MAGIC_SERIAL_ONLY_RESET     0x4e
 #define DFU_MAGIC_UF2_RESET             0x57
 #define DFU_MAGIC_SKIP                  0x6d
+#define DFU_MAGIC_QSPI_APPLY           0xCC  // Apply staged firmware from QSPI flash
 
 #define DFU_DBL_RESET_MAGIC             0x5A1AD5      // SALADS
 #define DFU_DBL_RESET_APP               0x4ee5677e
 #define DFU_DBL_RESET_DELAY             500
 #define DFU_DBL_RESET_MEM               0x20007F7C
+
+// RAM-based bootloader entry: firmware writes these to DFU_DBL_RESET_MEM
+// instead of GPREGRET. RAM at 0x20007F7C survives system reset (proven by
+// double-reset detection above). Unlike GPREGRET, RAM is not affected by
+// USB hub port power-cycling during device reset.
+#define DFU_RAM_MAGIC_UF2              0xBEEF0057
+#define DFU_RAM_MAGIC_BLE              0xBEEF00A8
+#define DFU_RAM_MAGIC_QSPI             0xBEEF00CC
 
 #define BOOTLOADER_VERSION_REGISTER     NRF_TIMER2->CC[0]
 #define DFU_SERIAL_STARTUP_INTERVAL     1000
@@ -227,22 +236,231 @@ int main(void)
     bootloader_app_start();
   }
 
+#ifdef DEFAULT_TO_OTA_DFU
+  if (!bootloader_app_is_valid()) {
+    NRF_POWER->GPREGRET = DFU_MAGIC_OTA_RESET;
+  }
+#endif
+
   NVIC_SystemReset();
+}
+
+/*------------- QSPI Staged OTA Apply -------------*/
+/* Firmware is staged in external QSPI flash (P25Q16H, 2 MB) by the running
+ * application. When the app sets GPREGRET=0xCC and resets, the bootloader
+ * reads the staged firmware from QSPI, validates CRC, and copies to internal
+ * flash. If validation fails, the old application boots normally.
+ *
+ * QSPI layout:
+ *   0x000000: 8-byte header {uint32 size, uint16 crc16, uint16 magic=0xB10C}
+ *   0x001000: Firmware binary (4KB-aligned)
+ *
+ * Safety: GPREGRET is cleared BEFORE any QSPI operations. If this code
+ * crashes, the device resets with GPREGRET=0 and boots the old app.
+ * Internal flash is only erased after the QSPI data passes CRC validation.
+ */
+#include "nrfx_qspi.h"
+#include "crc16.h"
+
+#define QSPI_STAGING_HEADER_ADDR    0x000000
+#define QSPI_STAGING_FIRMWARE_ADDR  0x001000
+#define QSPI_STAGING_MAGIC          0xB10C
+
+typedef struct __attribute__((packed)) {
+  uint32_t size;
+  uint16_t crc16;
+  uint16_t magic;
+} qspi_staging_header_t;
+
+static bool qspi_apply_staged_firmware(void)
+{
+  // XIAO nRF52840 Sense QSPI pins (physical P0.xx, NOT Arduino logical pins)
+  nrfx_qspi_config_t qcfg = {
+    .xip_offset = 0,
+    .pins = {
+      .sck_pin = NRF_GPIO_PIN_MAP(0, 21),
+      .csn_pin = NRF_GPIO_PIN_MAP(0, 25),
+      .io0_pin = NRF_GPIO_PIN_MAP(0, 20),
+      .io1_pin = NRF_GPIO_PIN_MAP(0, 24),
+      .io2_pin = NRF_GPIO_PIN_MAP(0, 22),
+      .io3_pin = NRF_GPIO_PIN_MAP(0, 23),
+    },
+    .prot_if = {
+      .readoc   = NRF_QSPI_READOC_READ4O,
+      .writeoc  = NRF_QSPI_WRITEOC_PP4O,
+      .addrmode = NRF_QSPI_ADDRMODE_24BIT,
+    },
+    .phy_if = {
+      .sck_delay = 10,
+      .dpmen     = false,
+      .spi_mode  = NRF_QSPI_MODE_0,
+      .sck_freq  = NRF_QSPI_FREQ_32MDIV16,  // 2 MHz (conservative)
+    },
+    .irq_priority = 7,
+  };
+
+  // Init QSPI peripheral (polling mode — no IRQ handler)
+  if (nrfx_qspi_init(&qcfg, NULL, NULL) != NRFX_SUCCESS) {
+    PRINTF("QSPI init failed\r\n");
+    return false;
+  }
+
+  // Read staging header
+  qspi_staging_header_t hdr __attribute__((aligned(4)));
+  if (nrfx_qspi_read(&hdr, sizeof(hdr), QSPI_STAGING_HEADER_ADDR) != NRFX_SUCCESS) {
+    PRINTF("QSPI header read failed\r\n");
+    nrfx_qspi_uninit();
+    return false;
+  }
+
+  // Validate header
+  // Validate header. Hardcoded upper bound (820 KB = 0xCD000) as safety net
+  // in case DFU_IMAGE_MAX_SIZE_FULL is corrupted by bad SoftDevice info struct.
+  if (hdr.magic != QSPI_STAGING_MAGIC || hdr.size == 0 ||
+      hdr.size > DFU_IMAGE_MAX_SIZE_FULL || hdr.size > 0xCD000) {
+    PRINTF("QSPI header invalid (magic=0x%04X size=%lu)\r\n", hdr.magic, hdr.size);
+    nrfx_qspi_uninit();
+    return false;
+  }
+
+  PRINTF("QSPI staged: %lu bytes, CRC=0x%04X\r\n", hdr.size, hdr.crc16);
+
+  // Read firmware from QSPI and compute CRC16 incrementally
+  static uint8_t chunk_buf[4096] __attribute__((aligned(4)));
+  uint16_t crc = 0xFFFF;
+  uint32_t remaining = hdr.size;
+  uint32_t qspi_offset = QSPI_STAGING_FIRMWARE_ADDR;
+
+  while (remaining > 0) {
+    uint32_t chunk_len = (remaining > sizeof(chunk_buf)) ? sizeof(chunk_buf) : remaining;
+    // Round up to 4-byte alignment for QSPI read
+    uint32_t read_len = (chunk_len + 3) & ~3;
+
+    if (nrfx_qspi_read(chunk_buf, read_len, qspi_offset) != NRFX_SUCCESS) {
+      PRINTF("QSPI read failed at 0x%08lX\r\n", qspi_offset);
+      nrfx_qspi_uninit();
+      return false;
+    }
+
+    crc = crc16_compute(chunk_buf, chunk_len, &crc);
+    qspi_offset += chunk_len;
+    remaining -= chunk_len;
+  }
+
+  // Validate CRC
+  if (crc != hdr.crc16) {
+    PRINTF("QSPI CRC mismatch: computed=0x%04X expected=0x%04X\r\n", crc, hdr.crc16);
+    nrfx_qspi_uninit();
+    return false;
+  }
+
+  PRINTF("QSPI CRC OK — applying to internal flash\r\n");
+  led_state(STATE_WRITING_STARTED);
+
+  // === POINT OF NO RETURN: erase internal app flash and copy from QSPI ===
+  remaining = hdr.size;
+  qspi_offset = QSPI_STAGING_FIRMWARE_ADDR;
+  uint32_t flash_addr = CODE_REGION_1_START;
+
+  while (remaining > 0) {
+    uint32_t chunk_len = (remaining > sizeof(chunk_buf)) ? sizeof(chunk_buf) : remaining;
+    uint32_t read_len = (chunk_len + 3) & ~3;
+
+    if (nrfx_qspi_read(chunk_buf, read_len, qspi_offset) != NRFX_SUCCESS) {
+      PRINTF("QSPI re-read failed at 0x%08lX\r\n", qspi_offset);
+      break;  // Can't recover — flash is partially written. SafeBootWatchdog will handle.
+    }
+
+    // flash_nrf5x_write handles page erase + write with caching
+    flash_nrf5x_write(flash_addr, chunk_buf, chunk_len, true);
+
+    flash_addr += chunk_len;
+    qspi_offset += chunk_len;
+    remaining -= chunk_len;
+  }
+
+  // Flush any remaining cached page
+  flash_nrf5x_flush(true);
+
+  // Update bootloader settings so bootloader_app_is_valid() returns true
+  bootloader_settings_t settings;
+  memset(&settings, 0, sizeof(settings));
+  settings.bank_0 = BANK_VALID_APP;
+  settings.bank_0_crc = hdr.crc16;
+  settings.bank_0_size = hdr.size;
+  settings.bank_1 = BANK_INVALID_APP;
+
+  nrfx_nvmc_page_erase(BOOTLOADER_SETTINGS_ADDRESS);
+  nrfx_nvmc_words_write(BOOTLOADER_SETTINGS_ADDRESS,
+                        (uint32_t const *)&settings,
+                        sizeof(settings) / sizeof(uint32_t));
+
+  // Clear staging header by erasing the entire header sector (4 KB).
+  // This sets all bits to 0xFF, so magic becomes 0xFFFF (invalid).
+  // A sector erase is more reliable than a partial page write — the
+  // nrfx_qspi_write of zeros was observed to fail silently on some boots,
+  // leaving magic=0xB10C and causing harmless but wasteful re-application.
+  nrfx_qspi_erase(NRF_QSPI_ERASE_LEN_4KB, QSPI_STAGING_HEADER_ADDR);
+
+  nrfx_qspi_uninit();
+
+  PRINTF("QSPI OTA applied: %lu bytes to 0x%08lX\r\n", hdr.size, (uint32_t)CODE_REGION_1_START);
+  led_state(STATE_WRITING_FINISHED);
+
+  return true;
 }
 
 static void check_dfu_mode(void)
 {
   uint32_t const gpregret = NRF_POWER->GPREGRET;
 
+  // QSPI staged OTA: apply pre-validated firmware from external QSPI flash.
+  // Check RAM magic first (reliable through USB hub resets), then GPREGRET.
+  bool qspi_requested = false;
+  if (*dbl_reset_mem == DFU_RAM_MAGIC_QSPI) {
+    (*dbl_reset_mem) = 0;  // Clear immediately (one-shot)
+    qspi_requested = true;
+    PRINTF("QSPI OTA apply requested (RAM magic)\r\n");
+  } else if (gpregret == DFU_MAGIC_QSPI_APPLY) {
+    NRF_POWER->GPREGRET = 0;
+    qspi_requested = true;
+    PRINTF("QSPI OTA apply requested (GPREGRET)\r\n");
+  }
+  if (qspi_requested) {
+    if (qspi_apply_staged_firmware()) {
+      return;
+    }
+    PRINTF("QSPI apply failed — falling through to normal boot\r\n");
+  }
+
+  // RAM-based bootloader entry: check DFU_DBL_RESET_MEM for firmware-written
+  // magic values. This bypasses GPREGRET entirely — RAM at 0x20007F7C survives
+  // system reset (same address used by double-reset detection). Firmware writes
+  // these values before NVIC_SystemReset() as a reliable alternative to GPREGRET
+  // which can be cleared by USB hub port power-cycling during reset.
+  uint32_t const ram_magic = *dbl_reset_mem;
+  bool ram_uf2 = false;
+  bool ram_ota = false;
+
+  if (ram_magic == DFU_RAM_MAGIC_UF2) {
+    (*dbl_reset_mem) = 0;  // Clear immediately (one-shot)
+    ram_uf2 = true;
+    PRINTF("RAM magic: UF2 mode requested\r\n");
+  } else if (ram_magic == DFU_RAM_MAGIC_BLE) {
+    (*dbl_reset_mem) = 0;
+    ram_ota = true;
+    PRINTF("RAM magic: BLE DFU mode requested\r\n");
+  }
+
   // SD is already Initialized in case of BOOTLOADER_DFU_OTA_MAGIC
   _sd_inited = (gpregret == DFU_MAGIC_OTA_APPJUM);
 
   // Start Bootloader in BLE OTA mode
-  _ota_dfu = (gpregret == DFU_MAGIC_OTA_APPJUM) || (gpregret == DFU_MAGIC_OTA_RESET);
+  _ota_dfu = ram_ota || (gpregret == DFU_MAGIC_OTA_APPJUM) || (gpregret == DFU_MAGIC_OTA_RESET);
 
   // Serial only mode
   bool const serial_only_dfu = (gpregret == DFU_MAGIC_SERIAL_ONLY_RESET);
-  bool const uf2_dfu         = (gpregret == DFU_MAGIC_UF2_RESET);
+  bool const uf2_dfu         = ram_uf2 || (gpregret == DFU_MAGIC_UF2_RESET);
   bool const dfu_skip        = (gpregret == DFU_MAGIC_SKIP);
 
   bool const reason_reset_pin = (NRF_POWER->RESETREAS & POWER_RESETREAS_RESETPIN_Msk) ? true : false;
@@ -268,6 +486,12 @@ static void check_dfu_mode(void)
   bool const just_start_app = valid_app && !dfu_start && (*dbl_reset_mem) == DFU_DBL_RESET_APP;
 
   if (!just_start_app && APP_ASKS_FOR_SINGLE_TAP_RESET()) dfu_start = 1;
+
+#ifdef DEFAULT_TO_OTA_DFU
+  if ((dfu_start || !valid_app) && !serial_only_dfu && !uf2_dfu) {
+    _ota_dfu = 1;
+  }
+#endif
 
   // App mode: Double Reset detection or DFU startup for nrf52832
   if ( ! (just_start_app || dfu_start || !valid_app) )

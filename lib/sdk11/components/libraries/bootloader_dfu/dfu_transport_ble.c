@@ -745,6 +745,8 @@ static void on_ble_evt(ble_evt_t * p_ble_evt)
         case BLE_GAP_EVT_CONNECTED:
             m_conn_handle    = p_ble_evt->evt.gap_evt.conn_handle;
             m_is_advertising = false;
+            { extern volatile bool dfu_startup_packet_received;
+              dfu_startup_packet_received = true; }
             break;
 
         case BLE_GAP_EVT_DISCONNECTED:

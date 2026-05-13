@@ -8,6 +8,11 @@
 #define NRFX_CLOCK_ENABLED  0
 #define NRFX_NVMC_ENABLED   1
 
+// QSPI — used for staged OTA: firmware is received to QSPI flash by the app,
+// then the bootloader copies it to internal flash on next boot (GPREGRET=0xCC).
+#define NRFX_QSPI_ENABLED  1
+#define NRFX_QSPI_DEFAULT_CONFIG_IRQ_PRIORITY 7
+
 #define NRFX_PRS_ENABLED    0
 
 #define NRFX_PWM_ENABLED    0
