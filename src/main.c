@@ -488,7 +488,22 @@ static void check_dfu_mode(void)
   if (!just_start_app && APP_ASKS_FOR_SINGLE_TAP_RESET()) dfu_start = 1;
 
 #ifdef DEFAULT_TO_OTA_DFU
-  if ((dfu_start || !valid_app) && !serial_only_dfu && !uf2_dfu) {
+  /* Force BLE OTA DFU only for "silent" triggers: invalid app, or
+   * app-initiated DFU without an explicit UF2/serial magic. Do NOT
+   * coerce physical-user DFU entry (double-tap reset, DFU button,
+   * APP_ASKS_FOR_SINGLE_TAP_RESET) — those have always meant
+   * "give me USB UF2". Breaking them would remove the wired-recovery
+   * escape hatch this bootloader's reset button is designed to provide.
+   *
+   * Use case split:
+   *   sealed sculpture device, mid-DFU corruption → !valid_app → BLE DFU
+   *   accessible device, user double-taps reset    → UF2 mode (preserved)
+   */
+  bool const physical_user_dfu =
+      (((*dbl_reset_mem) == DFU_DBL_RESET_MAGIC) && reason_reset_pin) ||
+      button_pressed(BUTTON_DFU) ||
+      APP_ASKS_FOR_SINGLE_TAP_RESET();
+  if ((dfu_start || !valid_app) && !serial_only_dfu && !uf2_dfu && !physical_user_dfu) {
     _ota_dfu = 1;
   }
 #endif
