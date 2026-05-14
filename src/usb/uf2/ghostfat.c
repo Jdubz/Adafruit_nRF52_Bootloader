@@ -224,7 +224,26 @@ static inline bool is_uf2_block (UF2_Block const *bl)
 // used when upgrading application
 static inline bool in_app_space (uint32_t addr)
 {
-  return USER_FLASH_START <= addr && addr < USER_FLASH_END;
+  // The "app space" is the writable region BETWEEN the SoftDevice (if any)
+  // and the bootloader settings area. Using USER_FLASH_START (= MBR_SIZE,
+  // 0x1000) as the lower bound would silently allow app-UF2 writes into the
+  // SoftDevice region (0x1000–CODE_REGION_1_START), corrupting the running
+  // BLE stack and producing a hard-to-diagnose WDT reset loop. The blast
+  // radius: any app UF2 mistakenly built from a combined SD+app hex, OR any
+  // hand-crafted "kill" UF2 targeting what the author thought was the app
+  // start address but which actually fell inside SD region, scribbles all
+  // over the running SoftDevice.
+  //
+  // CODE_REGION_1_START reads the SD's reported end address at runtime
+  // (via SD_SIZE_GET(MBR_SIZE)) and collapses to MBR_SIZE if no SD is
+  // present.
+  //
+  // History: bench device 2A798EF8 (2026-05-13) was driven into a
+  // permanent WDT loop by an F1 test UF2 that wrote 0xFF to 0x26000
+  // assuming it was the app start. The real app start (with S140 v7.3.0)
+  // is 0x27000; 0x26000 is still inside the SoftDevice. The bootloader
+  // dutifully erased that SD page and wrote 0xFFs back.
+  return CODE_REGION_1_START <= addr && addr < USER_FLASH_END;
 }
 
 // used when upgrading bootloader
@@ -433,11 +452,16 @@ int write_block (uint32_t block_no, uint8_t *data, WriteState *state)
       {
         PRINTF("Write addr = 0x%08lX, block = %ld (%ld of %ld)\r\n", bl->targetAddr, bl->blockNo, state->numWritten, bl->numBlocks);
         flash_nrf5x_write(bl->targetAddr, bl->data, bl->payloadSize, true);
-      }else if ( bl->targetAddr < USER_FLASH_START )
+      }else if ( bl->targetAddr < CODE_REGION_1_START )
       {
-        // do nothing if writing to MBR, occurs when SD hex is included
-        // keep going as successful write
-        PRINTF("skip writing to MBR\r\n");
+        // Silently skip writes to MBR (0x0–MBR_SIZE) and to the SoftDevice
+        // region (MBR_SIZE–CODE_REGION_1_START). Both occur naturally in
+        // combined SD+app UF2s. Overwriting either is destructive: the SD
+        // is the running BLE stack, and corrupting it strands the device
+        // in a WDT reset loop (this is exactly what the in_app_space fix
+        // above is guarding against — the second line of defense, in case
+        // some future change in in_app_space loses the SD-aware lower bound).
+        PRINTF("skip writing to MBR/SoftDevice region (0x%08lX)\r\n", bl->targetAddr);
       }else
       {
         return -1;
