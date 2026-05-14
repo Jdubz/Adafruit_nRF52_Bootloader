@@ -37,6 +37,11 @@
 void flash_nrf5x_write (uint32_t dst, void const *src, int len, bool need_erase);
 void flash_nrf5x_flush (bool need_erase);
 
+// Hook invoked from main.c proc_soc() for each SoC event. Lets the flash
+// layer pick up NRF_EVT_FLASH_OPERATION_{SUCCESS,ERROR} when SD-aware
+// writes are in flight. Safe to call with any event id.
+void flash_nrf5x_sd_event (uint32_t soc_evt);
+
 #ifdef __cplusplus
  }
 #endif

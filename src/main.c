@@ -717,6 +717,12 @@ uint32_t proc_soc(void)
   {
     pstorage_sys_event_handler(soc_evt);
 
+    // Wakes flash_nrf5x_flush() when an SD-aware page erase/write completes.
+    // Needed for dual-transport DFU (SD enabled) — the USB-MSC UF2 path
+    // also routes through sd_flash_* in that mode.
+    extern void flash_nrf5x_sd_event(uint32_t soc_evt);
+    flash_nrf5x_sd_event(soc_evt);
+
 #ifdef NRF_USBD
     /*------------- usb power event handler -------------*/
     int32_t usbevt = (soc_evt == NRF_EVT_POWER_USB_DETECTED   ) ? NRFX_POWER_USB_EVT_DETECTED:
