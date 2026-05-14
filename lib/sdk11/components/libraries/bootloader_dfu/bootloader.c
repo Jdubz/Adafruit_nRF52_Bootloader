@@ -337,13 +337,20 @@ uint32_t bootloader_dfu_start(bool ota, uint32_t timeout_ms, bool cancel_timeout
     app_timer_start(_dfu_startup_timer, APP_TIMER_TICKS(timeout_ms), NULL);
   }
 
-  if ( ota )
-  {
-    err_code = dfu_transport_ble_update_start();
-  }else
-  {
-    err_code = dfu_transport_serial_update_start();
-  }
+  /* Always register the BLE DFU service. USB MSC (UF2) is independently
+   * active any time `usb_init()` was called by the bootloader entry path
+   * (see check_dfu_mode in main.c) — ghostfat handles UF2 block writes
+   * via TinyUSB MSC callbacks, no per-mode "start" needed. The legacy
+   * CDC-based Nordic Serial DFU protocol is NOT registered: it's been
+   * superseded by UF2 MSC and is banned in this project anyway
+   * (see CLAUDE.md "NEVER use adafruit-nrfutil dfu serial").
+   *
+   * The `ota` parameter retains its other roles (LED hints, timeout
+   * cancel-on-USB semantics) but no longer gates which transport is
+   * available — both are.
+   */
+  (void) ota;
+  err_code = dfu_transport_ble_update_start();
 
   wait_for_events();
 

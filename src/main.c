@@ -543,40 +543,42 @@ static void check_dfu_mode(void)
   // Enter DFU mode accordingly to input
   if ( dfu_start || !valid_app )
   {
-    if ( _ota_dfu )
-    {
-      led_state(STATE_BLE_DISCONNECTED);
-
-      if (!_sd_inited ) mbr_init_sd();
-      _sd_inited = true;
-
-      ble_stack_init();
-    }
-    else
-    {
-      led_state(STATE_USB_UNMOUNTED);
-      usb_init(serial_only_dfu);
-    }
+    /* Always initialize BOTH transports — USB (MSC for UF2 + CDC) and BLE
+     * — so a device in DFU mode is reachable by either path. One bootloader
+     * binary for sealed and unsealed devices; no operational ambiguity
+     * about "is this device visible right now?". The `_ota_dfu` flag
+     * still influences the LED pattern (visual hint about how DFU was
+     * entered) and the `ota` argument to `bootloader_dfu_start` (which
+     * historically picked the transport — now both are started always).
+     *
+     * Cost: extra ~5-10 KB RAM for the USB stack alongside SoftDevice
+     * (we have 250 KB+ headroom on nRF52840), and a couple hundred ms
+     * extra init time at every DFU entry. Worth it.
+     */
+    led_state(_ota_dfu ? STATE_BLE_DISCONNECTED : STATE_USB_UNMOUNTED);
+    if (!_sd_inited ) mbr_init_sd();
+    _sd_inited = true;
+    ble_stack_init();
+    usb_init(serial_only_dfu);
 
     // Initiate an update of the firmware.
     if (APP_ASKS_FOR_SINGLE_TAP_RESET() || uf2_dfu || serial_only_dfu)
     {
-      // If USB is not enumerated in 3s (eg. because we're running on battery), we restart into app.
+      // If neither USB enumeration nor BLE connection happens within 3s
+      // (eg. running on battery, fleet server not nearby), we restart
+      // into the app. Both transports' activity cancels the timeout
+      // (see dfu_transport_ble.c + msc_uf2.c first-write hooks).
        bootloader_dfu_start(_ota_dfu, 3000, true);
     }
     else
     {
-      // No timeout if bootloader requires user action (double-reset).
+      // No timeout: sealed-device autonomous recovery or user-action DFU.
        bootloader_dfu_start(_ota_dfu, 0, false);
     }
 
-    if ( _ota_dfu )
-    {
-      sd_softdevice_disable();
-    }else
-    {
-      usb_teardown();
-    }
+    // Teardown both transports.
+    sd_softdevice_disable();
+    usb_teardown();
   }
 }
 
