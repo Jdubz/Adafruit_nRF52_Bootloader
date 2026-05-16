@@ -184,8 +184,30 @@ bool bootloader_app_is_valid(void)
 
 static void bootloader_settings_save(bootloader_settings_t * p_settings)
 {
-  if ( is_ota() )
+  // Gate on actual SoftDevice state, NOT on is_ota() (== _ota_dfu).
+  //
+  // The original Adafruit code used is_ota() as a proxy for "SD is
+  // running" — true historically when each DFU session used exactly one
+  // transport (BLE=SD-running, USB=SD-off). Since the dual-transport
+  // commit (76d1e60) we run SD AND USB simultaneously: is_ota()==false
+  // but SD is enabled. Direct nrfx_nvmc_* writes silently no-op while
+  // SD is enabled and the radio is busy, leaving bank_0 unchanged.
+  // User-visible symptom: "UF2 consumed but device doesn't boot to app"
+  // — measured 90% failure rate on 0.8.0-4 BL during 2026-05-15
+  // iteration testing.
+  //
+  // d7be9be applied the same SD-aware fix to flash_nrf5x_flush; this
+  // is the matching fix for bootloader_settings_save. Reference:
+  // blinky_time docs/BOOTLOADER_PRODUCTION_AUDIT_2026_05_15.md
+  uint8_t sd_enabled = 0;
+  sd_softdevice_is_enabled(&sd_enabled);
+
+  if ( sd_enabled )
   {
+    // SD-aware path: pstorage_raw uses sd_flash_write under the hood,
+    // which serializes with the SD's radio scheduler. Async completion
+    // arrives via pstorage_callback_handler (triggered from
+    // pstorage_sys_event_handler in main.c proc_soc).
     uint32_t err_code = pstorage_clear(&m_bootsettings_handle, sizeof(bootloader_settings_t));
     APP_ERROR_CHECK(err_code);
 
@@ -194,6 +216,10 @@ static void bootloader_settings_save(bootloader_settings_t * p_settings)
   }
   else
   {
+    // SD disabled (e.g. legacy serial-only DFU, or pre-SD-init paths) —
+    // direct NVMC is safe and synchronous. The synthetic pstorage
+    // callback below keeps the upper-layer state machine consistent
+    // with the SD-async path.
     nrfx_nvmc_page_erase(BOOTLOADER_SETTINGS_ADDRESS);
     nrfx_nvmc_words_write(BOOTLOADER_SETTINGS_ADDRESS, (uint32_t *) p_settings, sizeof(bootloader_settings_t) / 4);
 
