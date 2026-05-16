@@ -39,6 +39,20 @@ uint32_t dfu_transport_serial_close(void);
 uint32_t dfu_transport_ble_update_start(void);
 uint32_t dfu_transport_ble_close();
 
+/**@brief Pause / resume BLE advertising during USB MSC activity.
+ *
+ * On dual-transport DFU mode (BLE + USB MSC simultaneously) the SoftDevice
+ * shares a flash op scheduler between the BLE radio and pstorage/sd_flash_*.
+ * Dense BLE advertising starves the flash op queue, stretching
+ * flash_nrf5x_flush() wait times from milliseconds to tens of seconds.
+ *
+ * The USB MSC path calls pause() on first WRITE10 and resume() on abort.
+ * Success path lets the system reset clear advertising state. Both are
+ * no-ops when BLE isn't advertising (no BLE init / central connected).
+ */
+void dfu_transport_ble_advertising_pause(void);
+void dfu_transport_ble_advertising_resume(void);
+
 #endif // DFU_TRANSPORT_H__
 
 /**@} */

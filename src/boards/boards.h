@@ -101,6 +101,11 @@ void led_pwm_enable(uint32_t led_index);
 void led_state(uint32_t state);
 void led_tick(void);
 
+// Millisecond counter driven by SysTick (1 kHz). Used by the USB MSC stuck-
+// transfer detector to bound how long the bootloader will sit in DFU mode
+// after the host stops sending UF2 blocks but before completion has fired.
+uint32_t board_millis(void);
+
 //--------------------------------------------------------------------+
 // BUTTONS
 //--------------------------------------------------------------------+

@@ -102,6 +102,7 @@ static bool                 m_tear_down_in_progress  = false;                   
 static bool                 m_pkt_rcpt_notif_enabled = false;                                        /**< Variable to denote whether packet receipt notification has been enabled by the DFU controller.*/
 static uint16_t             m_conn_handle            = BLE_CONN_HANDLE_INVALID;                      /**< Handle of the current connection. */
 static bool                 m_is_advertising         = false;                                        /**< Variable to indicate if advertising is ongoing.*/
+static bool                 m_paused_by_msc          = false;                                        /**< True when advertising was paused by the USB MSC path. Blocks the BLE_GAP_EVT_ADV_SET_TERMINATED handler from auto-restarting advertising while a USB MSC transfer is in flight (which would re-introduce SD flash-scheduler contention the pause was meant to remove). Cleared on resume. */
 static dfu_ble_peer_data_t  m_ble_peer_data;                                                         /**< BLE Peer data exchanged from application on buttonless update mode. */
 static bool                 m_ble_peer_data_valid    = false;                                        /**< True if BLE Peer data has been exchanged from application. */
 static uint32_t             m_direct_adv_cnt         = APP_DIRECTED_ADV_TIMEOUT;                     /**< Counter of direct advertisements. */
@@ -726,6 +727,26 @@ static void advertising_stop(void)
 }
 
 
+/**@brief Pause / resume hooks for the USB MSC path.
+ *
+ * Called from msc_uf2.c on first WRITE10 (pause) and on transfer abort
+ * (resume). Success path lets the system reset clear advertising state.
+ * Pause is a no-op if advertising is already off (no BLE init, or a BLE
+ * central is connected and the SD has already stopped advertising).
+ */
+void dfu_transport_ble_advertising_pause(void)
+{
+    m_paused_by_msc = true;
+    advertising_stop();
+}
+
+void dfu_transport_ble_advertising_resume(void)
+{
+    m_paused_by_msc = false;
+    advertising_start();
+}
+
+
 /**@brief Function for the Application's S110 SoftDevice event handler.
  *
  * @param[in] p_ble_evt S110 SoftDevice event.
@@ -810,6 +831,15 @@ static void on_ble_evt(ble_evt_t * p_ble_evt)
             if (p_ble_evt->evt.gap_evt.params.adv_set_terminated.reason == BLE_GAP_EVT_ADV_SET_TERMINATED_REASON_TIMEOUT)
             {
                 m_is_advertising = false;
+                // If the USB MSC path explicitly paused advertising, do NOT
+                // auto-restart here — that would undo the pause and re-introduce
+                // the SD flash-scheduler contention this whole codepath is
+                // meant to avoid. m_direct_adv_cnt is reset on disconnect, so
+                // skipping its decrement here is safe.
+                if (m_paused_by_msc)
+                {
+                    break;
+                }
                 m_direct_adv_cnt--;
                 if (m_direct_adv_cnt == 0)
                 {

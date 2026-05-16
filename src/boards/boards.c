@@ -176,6 +176,11 @@ void SysTick_Handler(void)
   led_tick();
 }
 
+uint32_t board_millis(void)
+{
+  return _systick_count;
+}
+
 
 void pwm_teardown(NRF_PWM_Type* pwm )
 {

@@ -131,6 +131,11 @@ static void wait_for_events(void)
     {
       tud_task();
       tud_cdc_write_flush();
+
+      // Recover from stuck UF2 transfers (numWritten < numBlocks + host
+      // idle). See msc_uf2_check_stuck() comment for the failure mode.
+      extern void msc_uf2_check_stuck(void);
+      msc_uf2_check_stuck();
     }
 #endif
 
