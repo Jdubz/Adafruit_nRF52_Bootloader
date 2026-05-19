@@ -140,7 +140,13 @@ extern void tusb_hal_nrf_power_event(uint32_t event);
 
 // These value must be the same with one in dfu_transport_ble.c
 #define BLEGAP_EVENT_LENGTH             6
-#define BLEGATT_ATT_MTU_MAX             23
+// Bumped 23 → 247 to lift the legacy DFU 20-byte-per-packet ceiling.
+// At MTU=247, ATT data payload is 244 bytes per write, which makes a
+// ~510 KB BLE-DFU transfer ~12x faster (≈30 s vs ≈5.5 min legacy).
+// MUST match the same define in dfu_transport_ble.c (the local define
+// there shadows this one).
+// OPEN_ISSUES §3.3 / [[feedback-enclosed-devices-no-physical]].
+#define BLEGATT_ATT_MTU_MAX             247
 enum { BLE_CONN_CFG_HIGH_BANDWIDTH = 1 };
 
 //--------------------------------------------------------------------+

@@ -37,7 +37,9 @@
 
 
 #define BLEGAP_EVENT_LENGTH             6
-#define BLEGATT_ATT_MTU_MAX             23
+// Bumped 23 → 247 (OPEN_ISSUES §3.3). MUST match the same define in
+// src/main.c — both must be raised together. See main.c for rationale.
+#define BLEGATT_ATT_MTU_MAX             247
 enum { BLE_CONN_CFG_HIGH_BANDWIDTH = 1 };
 
 #define DFU_REV_MAJOR                        0x00                                                    /** DFU Major revision number to be exposed. */
