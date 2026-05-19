@@ -130,6 +130,33 @@ extern void tusb_hal_nrf_power_event(uint32_t event);
 #define DFU_RAM_MAGIC_BLE              0xBEEF00A8
 #define DFU_RAM_MAGIC_QSPI             0xBEEF00CC
 
+// Boot-attempt counter (OPEN_ISSUES §3.1 / [[project-bl-no-app-crash-fallback]]).
+// RAM word at 0x20007F78 — one word below DFU_DBL_RESET_MEM, in the
+// SoftDevice-reserved zone but at the very top where the SD does not
+// actually allocate. Same "borrow the top of SD's region" pattern as
+// DFU_DBL_RESET_MEM. The firmware-side linker (Adafruit nRF52 BSP) does
+// not declare a variable at this address; per-attempt collision risk is
+// the same as DFU_DBL_RESET_MEM (which has worked since v28).
+//
+// Word layout: upper 24 bits = sentinel (BOOT_ATTEMPT_SENTINEL), lower
+// 8 bits = consecutive attempts since the last app handshake. The
+// sentinel disambiguates "uninitialised RAM that happens to look like a
+// valid count" from a real count — random RAM matching the sentinel is
+// a 1-in-2^24 collision, low enough to ignore.
+//
+// Increment: ``main()`` bumps the count just before
+// ``bootloader_app_start()``. Clear: firmware writes
+// ``BOOT_ATTEMPT_SENTINEL | 0`` once it reaches a known-good runtime
+// state (``SafeBootWatchdog::markStable()`` site at 60 s uptime).
+// Trigger: ``check_dfu_mode`` reads the counter; if ≥ THRESHOLD, forces
+// ``dfu_start = 1`` so the BL enters DFU mode instead of jumping to a
+// crash-looping app.
+#define BOOT_ATTEMPT_COUNTER_MEM        0x20007F78
+#define BOOT_ATTEMPT_SENTINEL           0xCAFE0000
+#define BOOT_ATTEMPT_SENTINEL_MASK      0xFFFFFF00
+#define BOOT_ATTEMPT_COUNT_MASK         0x000000FF
+#define BOOT_ATTEMPT_THRESHOLD          3
+
 #define BOOTLOADER_VERSION_REGISTER     NRF_TIMER2->CC[0]
 #define DFU_SERIAL_STARTUP_INTERVAL     1000
 
@@ -153,6 +180,7 @@ enum { BLE_CONN_CFG_HIGH_BANDWIDTH = 1 };
 //
 //--------------------------------------------------------------------+
 uint32_t* dbl_reset_mem = ((uint32_t*)  DFU_DBL_RESET_MEM );
+uint32_t* boot_attempt_counter = ((uint32_t*) BOOT_ATTEMPT_COUNTER_MEM);
 
 // true if ble, false if serial
 bool _ota_dfu = false;
@@ -237,6 +265,30 @@ int main(void)
 
     // clear in case we kept DFU_DBL_RESET_APP there
     (*dbl_reset_mem) = 0;
+
+    // App-handshake watchdog increment (OPEN_ISSUES §3.1). Bump the
+    // RAM-backed boot-attempt counter immediately before handing
+    // control to the app — by definition, this is the moment the BL
+    // gives up control. The app is responsible for clearing the
+    // counter once it reaches a known-good runtime state (firmware
+    // ``SafeBootWatchdog::markStable()`` at 60 s uptime). If the app
+    // crashes before that, the next BL boot reads the incremented
+    // value; after ``BOOT_ATTEMPT_THRESHOLD`` consecutive bumps with
+    // no clear, ``check_dfu_mode`` forces DFU on the next reset.
+    //
+    // Sentinel-bit handling: if the counter is uninitialised
+    // (sentinel mismatch — fresh chip or post-power-loss), restart
+    // the count at 1.
+    {
+      uint32_t const cur = *boot_attempt_counter;
+      uint8_t prev = ((cur & BOOT_ATTEMPT_SENTINEL_MASK) == BOOT_ATTEMPT_SENTINEL)
+                     ? (uint8_t)(cur & BOOT_ATTEMPT_COUNT_MASK)
+                     : 0;
+      uint8_t next = (prev < BOOT_ATTEMPT_COUNT_MASK) ? (uint8_t)(prev + 1) : prev;
+      *boot_attempt_counter = BOOT_ATTEMPT_SENTINEL | next;
+      __DSB();
+      __ISB();
+    }
 
     // start application
     bootloader_app_start();
@@ -492,6 +544,41 @@ static void check_dfu_mode(void)
   bool const just_start_app = valid_app && !dfu_start && (*dbl_reset_mem) == DFU_DBL_RESET_APP;
 
   if (!just_start_app && APP_ASKS_FOR_SINGLE_TAP_RESET()) dfu_start = 1;
+
+  // App-handshake watchdog (OPEN_ISSUES §3.1). The
+  // RebootFrequencyCounter in firmware catches crashes that survive
+  // long enough to run ``configStorage.begin``, but a crashy-but-valid
+  // app that HardFaults pre-BLE-init (or pre-LittleFS init) never
+  // reaches that counter — the BL would jump to the same broken app
+  // forever. The boot_attempt_counter at 0x20007F78 is RAM-backed and
+  // BL-managed: BL increments at app-jump time (line below at
+  // bootloader_app_start), firmware clears at the ``markStable()``
+  // milestone (60 s uptime). If we see THRESHOLD consecutive attempts
+  // without a clear, force DFU mode so the operator can re-flash.
+  {
+    uint32_t const counter_word = *boot_attempt_counter;
+    bool const counter_valid =
+        (counter_word & BOOT_ATTEMPT_SENTINEL_MASK) == BOOT_ATTEMPT_SENTINEL;
+    uint8_t const attempts = counter_valid ? (counter_word & BOOT_ATTEMPT_COUNT_MASK) : 0;
+    if (counter_valid && attempts >= BOOT_ATTEMPT_THRESHOLD) {
+      PRINTF("Boot-attempt counter at %u (>= %u) — forcing DFU\r\n",
+             attempts, BOOT_ATTEMPT_THRESHOLD);
+      dfu_start = 1;
+      // Pick DFU LED/transport hint based on VBUSDETECT — UF2 if a host
+      // is plugged in (faster bench recovery), BLE-DFU otherwise (sealed
+      // sculpture autonomous recovery). Mirrors the firmware's §3.2
+      // logic so the BL-forced and firmware-initiated recovery paths
+      // pick the same transport. Dual-transport is initialised in the
+      // existing block below regardless, so this only affects the LED
+      // hint and the eventual ``bootloader_dfu_start(_ota_dfu, ...)``
+      // arg.
+      bool const usb_present =
+          (NRF_POWER->USBREGSTATUS & POWER_USBREGSTATUS_VBUSDETECT_Msk) != 0;
+      if (!usb_present) {
+        _ota_dfu = true;
+      }
+    }
+  }
 
 #ifdef DEFAULT_TO_OTA_DFU
   /* Force BLE OTA DFU only for "silent" triggers: invalid app, or
