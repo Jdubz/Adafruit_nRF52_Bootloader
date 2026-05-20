@@ -131,30 +131,35 @@ extern void tusb_hal_nrf_power_event(uint32_t event);
 #define DFU_RAM_MAGIC_QSPI             0xBEEF00CC
 
 // Boot-attempt counter (OPEN_ISSUES §3.1 / [[project-bl-no-app-crash-fallback]]).
-// RAM word at 0x20007F78 — one word below DFU_DBL_RESET_MEM, in the
-// SoftDevice-reserved zone but at the very top where the SD does not
-// actually allocate. Same "borrow the top of SD's region" pattern as
-// DFU_DBL_RESET_MEM. The firmware-side linker (Adafruit nRF52 BSP) does
-// not declare a variable at this address; per-attempt collision risk is
-// the same as DFU_DBL_RESET_MEM (which has worked since v28).
 //
-// Word layout: upper 24 bits = sentinel (BOOT_ATTEMPT_SENTINEL), lower
-// 8 bits = consecutive attempts since the last app handshake. The
-// sentinel disambiguates "uninitialised RAM that happens to look like a
-// valid count" from a real count — random RAM matching the sentinel is
-// a 1-in-2^24 collision, low enough to ignore.
+// Encoded into the chip's GPREGRET hardware register (8 bits, persists
+// across NVIC_SystemReset, cleared only by power-on reset). This is the
+// SAME storage class as the existing BL magic values (0x57=UF2, 0xA8=OTA,
+// 0x4E=skipCRC, 0xB1=enterApp); we reserve the upper nibble 0x1_ for the
+// counter so it cannot collide with those magics or with the firmware's
+// SafeBootWatchdog::enterBootloaderWithMagic() writes.
 //
-// Increment: ``main()`` bumps the count just before
-// ``bootloader_app_start()``. Clear: firmware writes
-// ``BOOT_ATTEMPT_SENTINEL | 0`` once it reaches a known-good runtime
-// state (``SafeBootWatchdog::markStable()`` site at 60 s uptime).
-// Trigger: ``check_dfu_mode`` reads the counter; if ≥ THRESHOLD, forces
-// ``dfu_start = 1`` so the BL enters DFU mode instead of jumping to a
-// crash-looping app.
-#define BOOT_ATTEMPT_COUNTER_MEM        0x20007F78
-#define BOOT_ATTEMPT_SENTINEL           0xCAFE0000
-#define BOOT_ATTEMPT_SENTINEL_MASK      0xFFFFFF00
-#define BOOT_ATTEMPT_COUNT_MASK         0x000000FF
+// Encoding:
+//   GPREGRET == 0x1N (N=0..F)  → counter, current count = N
+//   GPREGRET == 0x00 / other   → no counter active, treat as count = 0
+//
+// We previously tried a RAM word at 0x20007F78 (one below DFU_DBL_RESET_MEM).
+// That ADDRESS falls inside the firmware's .bss section — the firmware's
+// Reset_Handler zeros BSS on every boot, BEFORE static init and main(),
+// silently erasing the BL's increment. The mechanism could never fire.
+// GPREGRET is not RAM, so the C runtime cannot touch it.
+//
+// Increment: BL writes 0x1(N+1) just before ``bootloader_app_start()``.
+// Clear: firmware clears the upper-nibble pattern in
+//   1) SafeBootWatchdog::begin() — early boot, catches "we are about to
+//      run the app, the BL's worry is no longer relevant"
+//   2) SafeBootWatchdog::markStable() at 60 s — defense in depth
+// Trigger: check_dfu_mode reads the counter; if N ≥ BOOT_ATTEMPT_THRESHOLD,
+// forces dfu_start = 1 so the BL enters DFU instead of jumping to an app
+// that is crash-looping before reaching SafeBootWatchdog::begin().
+#define BOOT_ATTEMPT_GPREGRET_PATTERN   0x10
+#define BOOT_ATTEMPT_GPREGRET_MASK      0xF0
+#define BOOT_ATTEMPT_COUNT_MASK         0x0F
 #define BOOT_ATTEMPT_THRESHOLD          3
 
 #define BOOTLOADER_VERSION_REGISTER     NRF_TIMER2->CC[0]
@@ -180,7 +185,6 @@ enum { BLE_CONN_CFG_HIGH_BANDWIDTH = 1 };
 //
 //--------------------------------------------------------------------+
 uint32_t* dbl_reset_mem = ((uint32_t*)  DFU_DBL_RESET_MEM );
-uint32_t* boot_attempt_counter = ((uint32_t*) BOOT_ATTEMPT_COUNTER_MEM);
 
 // true if ble, false if serial
 bool _ota_dfu = false;
@@ -267,25 +271,28 @@ int main(void)
     (*dbl_reset_mem) = 0;
 
     // App-handshake watchdog increment (OPEN_ISSUES §3.1). Bump the
-    // RAM-backed boot-attempt counter immediately before handing
+    // GPREGRET-backed boot-attempt counter immediately before handing
     // control to the app — by definition, this is the moment the BL
-    // gives up control. The app is responsible for clearing the
-    // counter once it reaches a known-good runtime state (firmware
-    // ``SafeBootWatchdog::markStable()`` at 60 s uptime). If the app
-    // crashes before that, the next BL boot reads the incremented
-    // value; after ``BOOT_ATTEMPT_THRESHOLD`` consecutive bumps with
-    // no clear, ``check_dfu_mode`` forces DFU on the next reset.
+    // gives up control. The firmware is responsible for clearing the
+    // counter once it reaches a known-good runtime state
+    // (SafeBootWatchdog::begin() at boot, markStable() at 60 s). If
+    // the firmware crashes before begin() runs, the next BL boot
+    // reads the incremented value; after BOOT_ATTEMPT_THRESHOLD
+    // consecutive bumps with no clear, check_dfu_mode forces DFU.
     //
-    // Sentinel-bit handling: if the counter is uninitialised
-    // (sentinel mismatch — fresh chip or post-power-loss), restart
-    // the count at 1.
+    // GPREGRET state at this point: existing magic processing above
+    // either matched (and cleared GPREGRET to 0 via the dfu_start /
+    // dfu_skip branch), or didn't match. So GPREGRET here is either
+    // 0 (clean — fresh chip, cold boot, post-DFU, or post-markStable),
+    // or 0x1N (counter from a previous crashy boot that didn't reach
+    // SafeBootWatchdog::begin to clear).
     {
-      uint32_t const cur = *boot_attempt_counter;
-      uint8_t prev = ((cur & BOOT_ATTEMPT_SENTINEL_MASK) == BOOT_ATTEMPT_SENTINEL)
+      uint8_t const cur = NRF_POWER->GPREGRET;
+      uint8_t prev = ((cur & BOOT_ATTEMPT_GPREGRET_MASK) == BOOT_ATTEMPT_GPREGRET_PATTERN)
                      ? (uint8_t)(cur & BOOT_ATTEMPT_COUNT_MASK)
                      : 0;
       uint8_t next = (prev < BOOT_ATTEMPT_COUNT_MASK) ? (uint8_t)(prev + 1) : prev;
-      *boot_attempt_counter = BOOT_ATTEMPT_SENTINEL | next;
+      NRF_POWER->GPREGRET = (uint8_t)(BOOT_ATTEMPT_GPREGRET_PATTERN | next);
       __DSB();
       __ISB();
     }
@@ -547,20 +554,30 @@ static void check_dfu_mode(void)
 
   // App-handshake watchdog (OPEN_ISSUES §3.1). The
   // RebootFrequencyCounter in firmware catches crashes that survive
-  // long enough to run ``configStorage.begin``, but a crashy-but-valid
-  // app that HardFaults pre-BLE-init (or pre-LittleFS init) never
+  // long enough to run configStorage.begin, but a crashy-but-valid
+  // app that HardFaults pre-BLE-init (or pre-static-init) never
   // reaches that counter — the BL would jump to the same broken app
-  // forever. The boot_attempt_counter at 0x20007F78 is RAM-backed and
-  // BL-managed: BL increments at app-jump time (line below at
-  // bootloader_app_start), firmware clears at the ``markStable()``
-  // milestone (60 s uptime). If we see THRESHOLD consecutive attempts
-  // without a clear, force DFU mode so the operator can re-flash.
+  // forever. The counter lives in GPREGRET (encoded as 0x1N) so it
+  // survives NVIC_SystemReset and is NEVER touched by the firmware's
+  // C startup .bss-zero (the previous RAM-based attempt at
+  // 0x20007F78 was silently zeroed every boot, defeating the
+  // mechanism). BL increments at app-jump time (block below at
+  // bootloader_app_start); firmware clears in SafeBootWatchdog::begin()
+  // (early — catches "we reached app, BL worry over") and
+  // markStable() at 60 s (defense in depth). If we see THRESHOLD
+  // consecutive attempts without a clear, force DFU.
+  //
+  // Note: GPREGRET may have been cleared to 0 just above (line
+  // ~530) if existing magic matched (dfu_start || dfu_skip). In
+  // that case our pattern check returns false and we don't force
+  // DFU. That's correct: a magic value already triggered DFU,
+  // so the §3.1 mechanism doesn't need to.
   {
-    uint32_t const counter_word = *boot_attempt_counter;
-    bool const counter_valid =
-        (counter_word & BOOT_ATTEMPT_SENTINEL_MASK) == BOOT_ATTEMPT_SENTINEL;
-    uint8_t const attempts = counter_valid ? (counter_word & BOOT_ATTEMPT_COUNT_MASK) : 0;
-    if (counter_valid && attempts >= BOOT_ATTEMPT_THRESHOLD) {
+    uint8_t const gpregret_now = NRF_POWER->GPREGRET;
+    bool const counter_active =
+        (gpregret_now & BOOT_ATTEMPT_GPREGRET_MASK) == BOOT_ATTEMPT_GPREGRET_PATTERN;
+    uint8_t const attempts = counter_active ? (gpregret_now & BOOT_ATTEMPT_COUNT_MASK) : 0;
+    if (counter_active && attempts >= BOOT_ATTEMPT_THRESHOLD) {
       PRINTF("Boot-attempt counter at %u (>= %u) — forcing DFU\r\n",
              attempts, BOOT_ATTEMPT_THRESHOLD);
       dfu_start = 1;
@@ -570,13 +587,21 @@ static void check_dfu_mode(void)
       // logic so the BL-forced and firmware-initiated recovery paths
       // pick the same transport. Dual-transport is initialised in the
       // existing block below regardless, so this only affects the LED
-      // hint and the eventual ``bootloader_dfu_start(_ota_dfu, ...)``
-      // arg.
+      // hint and the eventual bootloader_dfu_start(_ota_dfu, ...) arg.
       bool const usb_present =
           (NRF_POWER->USBREGSTATUS & POWER_USBREGSTATUS_VBUSDETECT_Msk) != 0;
       if (!usb_present) {
         _ota_dfu = true;
       }
+      // Clear GPREGRET so a successful DFU + reboot doesn't immediately
+      // re-trigger the force-DFU path (counter would otherwise still
+      // read >= threshold). The post-DFU reboot must start from a
+      // clean GPREGRET state; firmware's begin()/markStable would
+      // eventually clear it too, but only if the new firmware actually
+      // boots — clearing here is safer.
+      NRF_POWER->GPREGRET = 0;
+      __DSB();
+      __ISB();
     }
   }
 
