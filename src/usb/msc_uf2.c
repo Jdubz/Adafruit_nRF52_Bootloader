@@ -31,14 +31,17 @@
 #include "boards.h"
 #include "dfu_transport.h"
 
-// If the host stops writing for this long while the BL hasn't seen
-// `numWritten >= numBlocks` (i.e. a UF2 block went missing due to USB-level
-// corruption — early-return in write_block leaves writtenMask permanently
-// holed), declare the transfer stuck and reset. Without this the device
-// sits in DFU forever and the operator must hardware-reset to retry.
+// If, after at least one valid UF2 block has landed, no further valid UF2
+// block arrives for this long while `0 < numWritten < numBlocks` (i.e. a UF2
+// block went missing due to USB-level corruption — early-return in
+// write_block leaves writtenMask permanently holed), declare the transfer
+// stuck and reset. Without this the device sits in DFU forever and the
+// operator must hardware-reset to retry.
 //
-// 8s is conservative — successful drops complete in ~5s, and a 3-4s idle
-// after the last write is normal host behavior (FAT/dir update bookkeeping).
+// 8s is conservative — successful drops complete in ~5s. Only valid UF2
+// blocks refresh the idle clock: FAT/dir bookkeeping writes by the host do
+// not, so they can neither arm nor extend the timer (see
+// msc_uf2_check_stuck()).
 #define MSC_STUCK_TIMEOUT_MS  8000
 
 /*------------------------------------------------------------------*/
@@ -148,17 +151,20 @@ int32_t tud_msc_read10_cb (uint8_t lun, uint32_t lba, uint32_t offset, void* buf
   return count;
 }
 
-// Last WRITE10 timestamp (board_millis) — used by msc_uf2_check_stuck()
-// to detect when the host has gone idle but the transfer never completed.
-static volatile uint32_t _last_write10_ms = 0;
+// Timestamp (board_millis) of the last VALID UF2 block accepted by
+// write_block() — used by msc_uf2_check_stuck() to detect when the UF2 data
+// stream has stopped but the transfer never completed. Deliberately NOT
+// refreshed by non-UF2 sector writes (FAT, directory entries, the OS's own
+// metadata such as Windows' "System Volume Information"): the UF2 spec
+// expects the host to write such sectors and they say nothing about whether
+// a UF2 transfer is in progress.
+static volatile uint32_t _last_uf2_block_ms = 0;
 
 // Callback invoked when received WRITE10 command.
 // Process data in buffer to disk's storage and return number of written bytes
 int32_t tud_msc_write10_cb (uint8_t lun, uint32_t lba, uint32_t offset, uint8_t* buffer, uint32_t bufsize)
 {
   (void) lun;
-
-  _last_write10_ms = board_millis();
 
   // Pause BLE advertising on the FIRST WRITE10 of the BL session, BEFORE
   // we process any UF2 blocks. BLE adv events contend with sd_flash_*
@@ -181,7 +187,12 @@ int32_t tud_msc_write10_cb (uint8_t lun, uint32_t lba, uint32_t offset, uint8_t*
   {
     // Consider non-uf2 block write as successful
     // only break if write_block is busy with flashing (return 0)
-    if ( 0 == write_block(lba, buffer, &_wr_state) ) break;
+    int const wr = write_block(lba, buffer, &_wr_state);
+    if ( 0 == wr ) break;
+
+    // Positive return == a valid UF2 block was accepted (-1 == not a UF2
+    // block / rejected). Only these refresh the stuck-transfer idle clock.
+    if ( wr > 0 ) _last_uf2_block_ms = board_millis();
 
     lba++;
     buffer += 512;
@@ -318,9 +329,11 @@ bool tud_msc_start_stop_cb(uint8_t lun, uint8_t power_condition, bool start, boo
 // numWritten stays one (or more) below numBlocks forever. Without
 // intervention the device sits in DFU mode permanently.
 //
-// Detection: numBlocks > 0 (transfer was started), numWritten < numBlocks
-// (transfer not complete), and the last WRITE10 was MSC_STUCK_TIMEOUT_MS
-// ago (host has gone idle, no more data is coming).
+// Detection: 0 < numWritten < numBlocks (at least one valid UF2 block
+// landed, so a UF2 transfer really started, but it is not complete), and
+// the last VALID UF2 block was MSC_STUCK_TIMEOUT_MS ago (the UF2 data stream
+// has stopped, no more blocks are coming). Non-UF2 sector writes neither
+// arm nor refresh this.
 //
 // Action: system reset via bootloader_dfu_update_process(DFU_RESET). The
 // next boot starts a fresh BL session — `_wr_state` is in BSS so it's
@@ -329,22 +342,27 @@ bool tud_msc_start_stop_cb(uint8_t lun, uint8_t power_condition, bool start, boo
 // Called from wait_for_events() in bootloader.c on every loop iteration.
 void msc_uf2_check_stuck(void)
 {
-  // Two stuck modes this recovers from:
-  //   (a) numBlocks > 0 but numWritten < numBlocks — some UF2 block was lost
-  //       to USB-level corruption (is_uf2_block magic check failed, write_block
-  //       returned -1 without setting writtenMask for that block).
-  //   (b) numBlocks == 0 but writes did land — host wrote FAT/dir metadata
-  //       but no valid UF2 block was ever delivered to the family-id-switch
-  //       in write_block (the entire UF2 data stream was lost / never sent).
+  // The one stuck mode this recovers from:
+  //   0 < numWritten < numBlocks — some UF2 block was lost to USB-level
+  //   corruption (is_uf2_block magic check failed, write_block returned -1
+  //   without setting writtenMask for that block), and the valid UF2 blocks
+  //   stopped arriving >= MSC_STUCK_TIMEOUT_MS ago.
   //
-  // Both require: the host stopped writing >= MSC_STUCK_TIMEOUT_MS ago.
-  // If no writes happened at all (_last_write10_ms == 0), there's nothing
-  // to recover from — leave the BL idle waiting for a host.
-  if (_last_write10_ms == 0) return;
-  if (_wr_state.numBlocks > 0 && _wr_state.numWritten >= _wr_state.numBlocks) return;
+  // History: an earlier version also reset when numBlocks == 0 but any
+  // WRITE10 had landed ("host wrote FAT/dir metadata but no UF2 block ever
+  // arrived"), timing idleness from every WRITE10. Measured 2026-10-20 on
+  // hat_v1: after `bootloader`, Windows mounts XIAO-SENSE and immediately
+  // writes "System Volume Information"; that metadata write armed the timer
+  // and the BL reset ~8.5 s after mount, so a person could never drag a file
+  // onto the drive or even pick it in a file dialog. The UF2 spec expects
+  // hosts to write non-UF2 sectors, and upstream Adafruit ghostfat ignores
+  // them with no timeout. So: no valid UF2 block yet => nothing to recover,
+  // stay in DFU waiting for the host (as upstream does).
+  if (_wr_state.numWritten == 0) return;                          // no valid UF2 block yet
+  if (_wr_state.numWritten >= _wr_state.numBlocks) return;        // complete (or numBlocks unset)
 
   uint32_t const now = board_millis();
-  if ((uint32_t)(now - _last_write10_ms) < MSC_STUCK_TIMEOUT_MS) return;
+  if ((uint32_t)(now - _last_uf2_block_ms) < MSC_STUCK_TIMEOUT_MS) return;
 
   // Reset via the existing DFU_RESET path. Tears down both transports and
   // tries to boot the (still-valid) app, allowing the host to retry the
