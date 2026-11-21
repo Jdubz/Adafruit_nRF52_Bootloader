@@ -67,6 +67,21 @@ jobs:
           mkdir -p $out
           cp $src/*.hex $src/*.uf2 $src/*.zip $src/*.map $out/
           for f in $src/*.out; do cp "$f" "$out/$(basename "${f%.out}").elf"; done
+          # adafruit-nrfutil stamps the build time into the DFU zip's entries;
+          # repack with the commit time so the zip is reproducible too.
+          python3 - "$out" "$(git log -1 --format=%ct)" <<'PY'
+          import glob, sys, time, zipfile
+          stamp = time.gmtime(int(sys.argv[2]))[:6]
+          for path in glob.glob(sys.argv[1] + "/*.zip"):
+              with zipfile.ZipFile(path) as z:
+                  entries = [(i.filename, z.read(i)) for i in sorted(z.infolist(), key=lambda i: i.filename)]
+              with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+                  for name, data in entries:
+                      info = zipfile.ZipInfo(name, stamp)
+                      info.compress_type = zipfile.ZIP_DEFLATED
+                      info.external_attr = 0o644 << 16
+                      z.writestr(info, data)
+          PY
           (cd $out && sha256sum * > SHA256SUMS && cat SHA256SUMS)
 
       - uses: actions/upload-artifact@v4
