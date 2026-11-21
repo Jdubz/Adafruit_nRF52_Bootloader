@@ -55,6 +55,9 @@ jobs:
         run: |
           arm-none-eabi-gcc --version | head -1
           git describe --dirty --always --tags
+          # __DATE__/__TIME__ (INFO_UF2 "Date:", ghostfat file timestamps) come from
+          # the commit time, so the same commit always builds the same bytes.
+          export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
           make BOARD=$BOARD ${{ matrix.variant == 'debug' && 'DEBUG=1' || '' }} all
 
       - name: Collect artifacts
