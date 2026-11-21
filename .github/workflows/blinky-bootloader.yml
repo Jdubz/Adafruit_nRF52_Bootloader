@@ -1,0 +1,92 @@
+# Build, verify and publish the blinky bootloader (xiao_nrf52840_ble_sense).
+#
+# This fork is maintained on its own (blinky-firmware docs/SWD_RECOVERY.md,
+# bootloader/README.md); upstream's all-boards matrix was removed. Every
+# push/PR to blinky-local-patches builds:
+#   release  the image that ships (update UF2, nosd hex, merged hex with S140 7.3.0)
+#   debug    DEBUG=1: RTT logging, bootloader moved to 0xED000. RTT blocks when
+#            its buffer fills, so it is only for SWD debugging sessions, never
+#            for a hands-off test run.
+# Each variant uploads the ELF and linker map with the images, so a fault
+# address can be symbolized, plus SHA256SUMS. A `bl-*` tag publishes the
+# release variant as a GitHub Release, which blinky-firmware pins by tag + sha256.
+name: blinky bootloader
+
+on:
+  push:
+    branches: [blinky-local-patches]
+    tags: ['bl-*']
+  pull_request:
+    branches: [blinky-local-patches]
+  workflow_dispatch:
+
+env:
+  BOARD: xiao_nrf52840_ble_sense
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [release, debug]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # git describe needs the tags (version string)
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # Same compiler as the fleet build (arm-none-eabi-gcc 9.2.1, bootloader/README.md).
+      - uses: carlosperate/arm-none-eabi-gcc-action@v1
+        with:
+          release: '9-2019-q4'
+
+      - name: Install tools
+        run: pip install adafruit-nrfutil intelhex
+
+      - name: Recoverability invariant (every DFU path starts USB)
+        run: python3 tools/verify_bootloader.py .
+
+      - name: Build
+        run: |
+          arm-none-eabi-gcc --version | head -1
+          git describe --dirty --always --tags
+          make BOARD=$BOARD ${{ matrix.variant == 'debug' && 'DEBUG=1' || '' }} all
+
+      - name: Collect artifacts
+        run: |
+          src=_build/build-$BOARD
+          out=dist/$BOARD-${{ matrix.variant }}
+          mkdir -p $out
+          cp $src/*.hex $src/*.uf2 $src/*.zip $src/*.map $out/
+          for f in $src/*.out; do cp "$f" "$out/$(basename "${f%.out}").elf"; done
+          (cd $out && sha256sum * > SHA256SUMS && cat SHA256SUMS)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BOARD }}-${{ matrix.variant }}
+          path: dist/${{ env.BOARD }}-${{ matrix.variant }}
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/bl-')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          tar czf ${BOARD}-debug.tar.gz ${BOARD}-debug
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" --notes "blinky bootloader $GITHUB_REF_NAME (xiao_nrf52840_ble_sense)" \
+            ${BOARD}-release/* ${BOARD}-debug.tar.gz
