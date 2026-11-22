@@ -23,7 +23,7 @@ History and rationale: blinky-firmware `bootloader/README.md` and `docs/BOOTLOAD
 - arm-none-eabi-gcc 9-2019-q4, the fleet toolchain;
 - `tools/verify_bootloader.py` must pass;
 - artifacts: ELF, linker map, hexes (with and without S140 7.3.0), update UF2, DFU zip, SHA256SUMS;
-- reproducible: `SOURCE_DATE_EPOCH` is the commit time and the DFU zip is repacked, so the same commit always builds the same bytes.
+- reproducible: `SOURCE_DATE_EPOCH` is the commit time and the DFU zip is repacked. The version string comes from `git describe` with `bl-*` tags excluded, so tagging a release doesn't change it. Same commit, same toolchain, same submodules: same bytes.
 
 A `bl-<version>` tag publishes a GitHub Release from the release variant (plus a debug tarball). blinky-firmware pins the source as its `bootloader/src` submodule.
 
