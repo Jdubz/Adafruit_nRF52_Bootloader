@@ -33,7 +33,10 @@ else
   LD_FILE = linker/$(MCU_SUB_VARIANT).ld
 endif
 
-GIT_VERSION := $(shell git describe --dirty --always --tags)
+# blinky: bl-* release tags name a published build; they must not become the
+# version string (MK_BOOTLOADER_VERSION parses its first field as a number, and
+# tagging a commit must not change the bytes it builds).
+GIT_VERSION := $(shell git describe --dirty --always --tags --exclude 'bl-*')
 GIT_SUBMODULE_VERSIONS := $(shell git submodule status | cut -d" " -f3,4 | paste -s -d" " -)
 
 # compiled file name
